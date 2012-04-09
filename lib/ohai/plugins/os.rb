@@ -37,7 +37,7 @@ when /openbsd(.+)$/
   os "openbsd"
 when /netbsd(.+)$/
   os "netbsd"
-when /solaris2\.([\d]+)/
+when /solaris2/
   os "solaris2"
 when /mswin|mingw32|windows/
   # After long discussion in IRC the "powers that be" have come to a concensus
@@ -47,7 +47,7 @@ when /mswin|mingw32|windows/
   # subsystems.
   os "windows"
 else
-  Object.const_get(defined?(RbConfig) ? :RbConfig : :Config)::CONFIG['host_os']
+  os ::RbConfig::CONFIG['host_os']
 end
 
 os_version kernel[:release]

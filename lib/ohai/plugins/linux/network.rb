@@ -45,6 +45,11 @@ end
 iface = Mash.new
 net_counters = Mash.new
 
+# Match the lead line for an interface from iproute2
+# 3: eth0.11@eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP 
+# The '@eth0:' portion doesn't exist on primary interfaces and thus is optional in the regex
+IPROUTE_INT_REGEX = /^(\d+): ([0-9a-zA-Z@:\.\-_]*?)(@[0-9a-zA-Z]+|):\s/
+
 if File.exist?("/sbin/ip")
 
   begin
@@ -64,9 +69,7 @@ if File.exist?("/sbin/ip")
     stdin.close
     cint = nil
     stdout.each do |line|
-      # 3: eth0.11@eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP 
-      # The '@eth0:' portion doesn't exist on primary interfaces and thus is optional in the regex
-      if line =~ /^(\d+): ([0-9a-zA-Z\.\-_]+)(@[0-9a-zA-Z]+|):\s/
+      if line =~ IPROUTE_INT_REGEX
         cint = $2
         iface[cint] = Mash.new
         if cint =~ /^(\w+)(\d+.*)/
@@ -91,9 +94,20 @@ if File.exist?("/sbin/ip")
         end
       end
       if line =~ /inet (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(\/(\d{1,2}))?/
-        iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
         tmp_addr, tmp_prefix = $1, $3
         tmp_prefix ||= "32"
+        original_int = nil
+
+        # Are we a formerly aliased interface?
+        if line =~ /#{cint}:(\d+)$/
+          sub_int = $1
+          alias_int = "#{cint}:#{sub_int}"
+          original_int = cint
+          cint = alias_int
+        end
+
+        iface[cint] = Mash.new unless iface[cint] # Create the fake alias interface if needed
+        iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
         iface[cint][:addresses][tmp_addr] = { "family" => "inet", "prefixlen" => tmp_prefix }
         iface[cint][:addresses][tmp_addr][:netmask] = IPAddr.new("255.255.255.255").mask(tmp_prefix.to_i).to_s
 
@@ -108,6 +122,9 @@ if File.exist?("/sbin/ip")
         if line =~ /scope (\w+)/
           iface[cint][:addresses][tmp_addr][:scope] = ($1.eql?("host") ? "Node" : $1.capitalize)
         end
+
+        # If we found we were an an alias interface, restore cint to its original value
+        cint = original_int unless original_int.nil?
       end
       if line =~ /inet6 ([a-f0-9\:]+)\/(\d+) scope (\w+)/
         iface[cint][:addresses] = Mash.new unless iface[cint][:addresses]
@@ -117,12 +134,12 @@ if File.exist?("/sbin/ip")
     end
   end
 
-  popen4("ip -s link") do |pid, stdin, stdout, stderr|
+  popen4("ip -d -s link") do |pid, stdin, stdout, stderr|
     stdin.close
     tmp_int = nil
     on_rx = true
     stdout.each do |line|
-      if line =~ /^(\d+): ([0-9a-zA-Z\.\-_]+):\s/
+      if line =~ IPROUTE_INT_REGEX
         tmp_int = $2
         net_counters[tmp_int] = Mash.new unless net_counters[tmp_int]
       end
@@ -149,6 +166,22 @@ if File.exist?("/sbin/ip")
         net_counters[tmp_int][:tx][:queuelen] = $1
       end
        
+      if line =~ /vlan id (\d+)/
+        tmp_id = $1
+        iface[tmp_int][:vlan] = Mash.new unless iface[tmp_int][:vlan]
+        iface[tmp_int][:vlan][:id] = tmp_id
+
+        vlan_flags = line.scan(/(REORDER_HDR|GVRP|LOOSE_BINDING)/)
+        if vlan_flags.length > 0
+          iface[tmp_int][:vlan][:flags] = vlan_flags.flatten.uniq
+        end
+      end
+
+      if line =~ /state (\w+)/
+        iface[tmp_int]['state'] = $1.downcase
+      end
+
+
     end
   end
 
@@ -159,6 +192,28 @@ if File.exist?("/sbin/ip")
         next unless iface[$2]
         iface[$2][:arp] = Mash.new unless iface[$2][:arp]
         iface[$2][:arp][$1] = $3.downcase
+      end
+    end
+  end
+
+  popen4("ip route show scope link") do |pid, stdin, stdout, stderr|
+    stdin.close
+    stdout.each do |line|
+      if line =~ /^([^\s]+)\s+dev\s+([^\s]+).*\s+src\s+([^\s]+)\b/
+        tmp_route_cidr = $1
+        tmp_int = $2
+        tmp_source_addr = $3
+        unless iface[tmp_int]
+          Ohai::Log.debug("Skipping previously unseen interface from 'ip route show scope link': #{tmp_int}")
+          next
+        end
+        iface[tmp_int][:routes] = Mash.new unless iface[tmp_int][:routes]
+        iface[tmp_int][:routes][tmp_route_cidr] = Mash.new( :scope => "Link", :src => tmp_source_addr )
+        if (network[:default_interface] == tmp_int ) && (IPAddr.new(tmp_route_cidr).include? network[:default_gateway])
+          ipaddress tmp_source_addr
+          macaddress iface[tmp_int][:addresses].select{|k,v| v["family"]=="lladdr"}.first.first
+          ip6address iface[tmp_int][:addresses].reject{|address, hash| hash['family'] != "inet6" || hash['scope'] != 'Global'}.first.first
+        end
       end
     end
   end
@@ -177,7 +232,9 @@ else
     cint = nil
     stdout.each do |line|
       tmp_addr = nil
-      if line =~ /^([0-9a-zA-Z\.\:\-_]+)\s+/
+      # dev_valid_name in the kernel only excludes slashes, nulls, spaces 
+      # http://git.kernel.org/?p=linux/kernel/git/stable/linux-stable.git;a=blob;f=net/core/dev.c#l851
+      if line =~ /^([0-9a-zA-Z@\.\:\-_]+)\s+/
         cint = $1
         iface[cint] = Mash.new
         if cint =~ /^(\w+)(\d+.*)/
