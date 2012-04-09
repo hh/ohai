@@ -63,22 +63,6 @@ adapters.each do |adapter|
     end
 end
 
-import socket
-
-def check_ipv6(n):
-    try:
-        socket.inet_pton(socket.AF_INET6, n)
-        return True
-    except socket.error:
-        return False
-
-def check_ipv6(n):
-    try:
-        socket.inet_pton(socket.AF_INET6, n)
-        return True
-    except socket.error:
-        return False
-
 iface_instance.keys.each do |i|
   if iface_config[i][:ip_enabled] and iface_instance[i][:net_connection_id] and iface_instance[i][:interface_index]
     cint = sprintf("0x%x", iface_instance[i][:interface_index]).downcase
